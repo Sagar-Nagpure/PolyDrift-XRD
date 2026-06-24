@@ -1,57 +1,37 @@
-# AM-Defect-2K
-
-# Dataset Description
+# PolyDrift-XRD: Dataset Description
 
 ## Overview
 
-AM-Defect-2K is a fully synthetic dataset of 2,000 grayscale micrographs (512x512 px, PNG) simulating optical microscopy of polished cross-sections from laser powder-bed fusion (LPBF) additive manufacturing builds. Each image depicts a microstructure region that may contain one of six defect types, no defect, or a co-occurrence of multiple defect types. The dataset is stratified across three confounder axes -- material alloy, optical magnification, and simulated illumination -- whose distributions vary across defect classes, reflecting natural biases in real-world AM data collection.
+PolyDrift-XRD is a synthetic but physically-grounded dataset of 12,000 powder X-ray diffraction (PXRD) patterns simulating a four-phase pharmaceutical-like crystalline system (alpha, beta, gamma polymorphs, plus an amorphous fraction). 
 
-This dataset is 100% synthetically generated using a procedural pipeline that renders physically-inspired microstructures (Voronoi grain boundaries, melt-pool patterns) and parametric defect morphologies. The generation script (`generate.py`) is included in the archive and is fully reproducible with a hardcoded random seed (42). No external or third-party data was used.
+Each pattern is corrupted with realistic instrumental and sample-handling artifacts — zero-shift, sample displacement error, preferred orientation (March-Dollase model), variable peak broadening, amorphous halo, Poisson counting noise, and linear background drift — so that naive peak-position lookup fails. The task is to recover the four-component phase fraction vector from the corrupted 1D pattern.
+
+The dataset addresses a clear gap in prior PXRD machine-learning literature, which has overwhelmingly evaluated on idealized simulated patterns and shown degraded performance on realistic instrumental drift. PolyDrift-XRD provides ground-truth phase fractions known exactly from the generation process, enabling rigorous evaluation of mixture-quantification models under distribution shift.
 
 ## File Structure
 
-```
-am_defect_2k/
-├── generate.py          # Fully reproducible synthesis script
-├── requirements.txt     # Python dependencies
-└── raw/
-    ├── metadata.csv     # Image metadata and labels (2000 rows)
-    └── images/
-        ├── 00000.png
-        ├── 00001.png
-        ├── ...
-        └── 01999.png
-```
+* `data.csv` — Sample-level metadata and ground-truth phase fractions.
+* `patterns/` — Directory of 12,000 `.npy` files; each contains a 1D `float32` array of length 4000 representing intensity values sampled uniformly over 2θ ∈ [5°, 90°] with step 0.02125°.
+* `reference/` — Four ideal reference patterns (`alpha.npy`, `beta.npy`, `gamma.npy`, `amorphous.npy`) without any drift or noise, provided as domain knowledge.
+* `generation/generate.py` — Fully reproducible generation script (seed = 42).
 
 ## Features
 
-| Column | Type | Description |
-|--------|------|-------------|
-| `image_id` | `str` | Unique identifier (5-digit zero-padded), maps to `{image_id}.png` |
-| `material` | `str` | Alloy code: `Ti64` (Ti-6Al-4V), `IN718` (Inconel 718), `AlSi` (AlSi10Mg) |
-| `magnification` | `int` | Objective magnification: `50`, `200`, or `500` |
-| `illumination` | `str` | Illumination mode: `bright_field`, `dark_field`, or `mixed` |
-| `label` | `int` | Defect class (0-7), see class table below |
+*The four phase fractions sum to 1.0 (within float32 tolerance) by construction.*
 
-### Defect Classes
+* **sample_id** *(string)*: UUID identifier; matches `patterns/{sample_id}.npy`.
+* **f_alpha** *(float32)*: Ground-truth alpha-phase mass fraction, in [0, 1].
+* **f_beta** *(float32)*: Ground-truth beta-phase mass fraction, in [0, 1].
+* **f_gamma** *(float32)*: Ground-truth gamma-phase mass fraction, in [0, 1].
+* **f_amorphous** *(float32)*: Ground-truth amorphous fraction, in [0, 1].
+* **zero_shift** *(float32)*: Applied global 2θ offset in degrees, in [-0.3, 0.3]. Provided for train only.
+* **crystallite_nm** *(float32)*: Simulated crystallite size in nanometers, in [15, 200]. Provided for train only.
+* **acquisition** *(string)*: One of `sim_A` or `sim_B`; controls noise/drift regime.
 
-| Class ID | Label | Description |
-|----------|-------|-------------|
-| 0 | `porosity` | Small, near-circular dark voids (10-40 um apparent diameter) |
-| 1 | `lack_of_fusion` | Irregular elongated dark regions at melt-pool boundaries |
-| 2 | `keyholing` | Deep, narrow keyhole-shaped voids with tapered profile |
-| 3 | `balling` | Spherical bead clusters on the surface |
-| 4 | `spatter` | Small bright particulate ejecta scattered across field |
-| 5 | `delamination` | Horizontal crack-like separations between layers |
-| 6 | `no_defect` | Clean, well-formed melt-pool microstructure |
-| 7 | `multi_defect` | Co-occurrence of 2 or more of the above defect types |
+## Notes
 
-### Contextual Notes
-
-- **Image format**: Grayscale PNG, 512x512 pixels, 8-bit depth
-- **Material variation**: Each alloy (Ti64, IN718, AlSi) exhibits distinct grain size distributions, base intensity, contrast, and sensor noise characteristics
-- **Magnification effects**: Higher magnification (500x) increases apparent defect size and fine detail; lower magnification (50x) introduces blur and reduces visible field of view
-- **Illumination modes**: Bright-field (uniform with slight directional gradient), dark-field (inverted ring pattern with darker center), and mixed (partial illumination with one half darkened) significantly alter defect visibility and contrast
-- **Controlled complexities**: The dataset includes simulated polishing artifacts (streaks/scratches) in approximately 3% of images, and natural parameter variation in defect renderers creates borderline cases where defect severity is near the classification threshold
-- **Reproducibility**: The entire dataset is regenerated by running `python generate.py --output_dir ./am_defect_2k --n_images 2000 --seed 42`
-"""
+* The four reference structures were chosen with deliberately overlapping peak positions in the 5°–40° region, so phase discrimination requires peak *intensity ratio* and *shape* analysis, not position alone.
+* Two acquisition regimes (`sim_A`, `sim_B`) differ in noise level, background slope distribution, and preferred-orientation severity. The test split is drawn predominantly from `sim_B` to enforce a covariate shift.
+* Reference patterns in `reference/` are provided as domain priors. Solvers may use them freely; they are computed at zero drift, zero noise, infinite crystallite size, and isotropic orientation.
+* Patterns are stored as raw intensity (not normalized). Solvers may rescale.
+* No real experimental data is included. Every pattern is generated by the provided script from first-principles structure factors plus the listed artifact models, eliminating any risk of memorization by foundation models.
