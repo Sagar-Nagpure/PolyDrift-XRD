@@ -1,653 +1,308 @@
 """
-AM-Defect-2K: Synthetic Additive Manufacturing Defect Micrograph Generator
-===========================================================================
-Generates 2,000 synthetic grayscale micrographs simulating polished cross-sections
-from laser powder-bed fusion (LPBF) additive manufacturing builds.
+PolyDrift-XRD: deterministic synthetic powder XRD dataset generator.
 
-8-class classification with confounder biases, class imbalance, and a
-compositional multi_defect trap designed to break autonomous AI agents.
+Reproducibility:
+    python generate.py --seed 42 --out ./polydrift_xrd_raw
 
-Usage:
-    python generate.py
+Provenance of reference structures (Crystallography Open Database, CC0):
+    alpha   : COD 1010368  (orthorhombic reference)
+    beta    : COD 1011000  (monoclinic  reference)
+    gamma   : COD 1528823  (triclinic   reference)
+    amorphous: synthetic broad-halo model (no crystalline reference)
 
-Output:
-    ./am_defect_2k/           <- dataset directory
-    ./am_defect_2k.zip        <- ready for Eris upload
+NOTE: The peak lists below are *stylized* approximations chosen so the three
+crystalline phases share most low-angle peaks and differ mainly in intensity
+ratios and high-angle fingerprints. This is intentional: the benchmark tests
+mixture quantification under overlap, not phase ID from disjoint peak sets.
 
-License: CC0 (Public Domain Dedication)
+License: CC BY 4.0
 """
 
-import os
-import sys
-import shutil
+from __future__ import annotations
 import argparse
-import numpy as np
-import pandas as pd
-from PIL import Image
-import cv2
+import hashlib
+import json
+import uuid
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+from scipy.ndimage import gaussian_filter1d
 
-# ============================================================
-# Configuration
-# ============================================================
+# ---------------------------------------------------------------------------
+# Global grid
+# ---------------------------------------------------------------------------
+TWO_THETA_MIN = 5.0
+TWO_THETA_MAX = 90.0
+N_POINTS = 4000
+GRID = np.linspace(TWO_THETA_MIN, TWO_THETA_MAX, N_POINTS, dtype=np.float64)
+STEP = GRID[1] - GRID[0]  # ~0.02125 deg
 
-IMG_SIZE = 512
-N_IMAGES = 2000
-SEED = 42
-
-CLASS_NAMES = {
-    0: 'porosity',
-    1: 'lack_of_fusion',
-    2: 'keyholing',
-    3: 'balling',
-    4: 'spatter',
-    5: 'delamination',
-    6: 'no_defect',
-    7: 'multi_defect'
+# ---------------------------------------------------------------------------
+# Stylized peak lists: (2theta_deg, relative_intensity)
+# Deliberately overlapping in 5-40 deg; fingerprint peaks live above 40 deg.
+# ---------------------------------------------------------------------------
+PEAKS = {
+    "alpha": [
+        (8.42, 1.00), (12.65, 0.55), (16.88, 0.40), (21.10, 0.72),
+        (25.32, 0.30), (29.55, 0.48), (33.78, 0.22), (44.10, 0.62),
+        (52.40, 0.35), (61.18, 0.28), (74.55, 0.18),
+    ],
+    "beta": [
+        (8.55, 0.95), (12.70, 0.80), (17.05, 0.25), (21.22, 0.60),
+        (25.40, 0.50), (29.61, 0.30), (33.90, 0.45), (47.85, 0.70),
+        (55.20, 0.40), (66.30, 0.25), (78.10, 0.20),
+    ],
+    "gamma": [
+        (8.48, 0.70), (12.60, 0.65), (16.95, 0.55), (21.15, 0.85),
+        (25.36, 0.42), (29.58, 0.60), (33.84, 0.38), (50.95, 0.55),
+        (58.40, 0.48), (69.75, 0.30), (82.40, 0.22),
+    ],
 }
-
-# Adjusted class prior (spatter/delamination bumped to 7%, no_defect to 20%)
-CLASS_PRIOR = {
-    0: 0.18,
-    1: 0.18,
-    2: 0.10,
-    3: 0.10,
-    4: 0.07,
-    5: 0.07,
-    6: 0.20,
-    7: 0.10
-}
-
-MATERIALS = ['Ti64', 'IN718', 'AlSi']
-MAGNIFICATIONS = [50, 200, 500]
-ILLUMINATIONS = ['bright_field', 'dark_field', 'mixed']
-
-MATERIAL_PARAMS = {
-    'Ti64': {
-        'grain_size': (15, 35),
-        'base_intensity': 120,
-        'contrast': 0.35,
-        'melt_pool_width': (20, 40),
-        'noise_std': 8
-    },
-    'IN718': {
-        'grain_size': (20, 45),
-        'base_intensity': 100,
-        'contrast': 0.30,
-        'melt_pool_width': (25, 50),
-        'noise_std': 10
-    },
-    'AlSi': {
-        'grain_size': (10, 25),
-        'base_intensity': 140,
-        'contrast': 0.40,
-        'melt_pool_width': (15, 35),
-        'noise_std': 6
-    }
-}
-
-POLISHING_ARTIFACT_RATE = 0.03
+PHASES_CRYST = ["alpha", "beta", "gamma"]
 
 
-# ============================================================
-# Base Microstructure Renderer
-# ============================================================
-
-def render_base_microstructure(material, magnification, rng):
-    params = MATERIAL_PARAMS[material]
-    img = np.full((IMG_SIZE, IMG_SIZE), params['base_intensity'], dtype=np.float32)
-
-    # Grain boundaries via Voronoi-like tessellation
-    grain_min, grain_max = params['grain_size']
-    scale_factor = 500.0 / magnification
-    effective_grain_size = int(np.mean([grain_min, grain_max]) * scale_factor)
-    effective_grain_size = max(5, effective_grain_size)
-
-    n_grains = max(4, (IMG_SIZE // effective_grain_size) ** 2)
-    seed_x = rng.integers(0, IMG_SIZE, size=n_grains)
-    seed_y = rng.integers(0, IMG_SIZE, size=n_grains)
-
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
-    grain_texture = np.zeros_like(img)
-    for i in range(n_grains):
-        dist = np.sqrt((xx - seed_x[i]) ** 2 + (yy - seed_y[i]) ** 2)
-        grain_texture += np.exp(-(dist / (effective_grain_size * 0.5)) ** 2) * 5
-
-    img -= grain_texture * params['contrast']
-
-    # Melt-pool pattern
-    pool_min, pool_max = params['melt_pool_width']
-    pool_width = int(rng.uniform(pool_min, pool_max) * scale_factor)
-    pool_width = max(10, pool_width)
-
-    hatch_angle = rng.uniform(-0.3, 0.3)
-    cos_a, sin_a = np.cos(hatch_angle), np.sin(hatch_angle)
-
-    cx, cy = IMG_SIZE / 2.0, IMG_SIZE / 2.0
-    xr = cos_a * (xx - cx) + sin_a * (yy - cy)
-    pool_pattern = np.sin(2 * np.pi * xr / pool_width) * 8 * params['contrast']
-    img += pool_pattern
-
-    img += rng.normal(0, 2, img.shape).astype(np.float32)
-    return np.clip(img, 0, 255)
+# ---------------------------------------------------------------------------
+# Physics-flavored building blocks
+# ---------------------------------------------------------------------------
+def pseudo_voigt(x: np.ndarray, center: float, fwhm: float, eta: float) -> np.ndarray:
+    """Normalized pseudo-Voigt (linear combo of Gaussian + Lorentzian)."""
+    sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    gauss = np.exp(-0.5 * ((x - center) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+    gamma = fwhm / 2.0
+    lorentz = (gamma / np.pi) / ((x - center) ** 2 + gamma ** 2)
+    return eta * lorentz + (1.0 - eta) * gauss
 
 
-# ============================================================
-# Defect Renderers
-# ============================================================
-
-def render_porosity(img, magnification, rng):
-    scale_factor = 500.0 / magnification
-    n_pores = int(rng.integers(3, 12))
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
-
-    for _ in range(n_pores):
-        cx = int(rng.integers(20, IMG_SIZE - 20))
-        cy = int(rng.integers(20, IMG_SIZE - 20))
-        radius = rng.uniform(5, 15) * scale_factor
-        radius = max(3, min(radius, 40))
-        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-        void = np.exp(-(dist / radius) ** 2) * rng.uniform(40, 70)
-        img -= void
-    return img
+def scherrer_fwhm(two_theta_deg: float, crystallite_nm: float,
+                  wavelength_a: float = 1.5406, K: float = 0.9) -> float:
+    """Scherrer broadening in degrees 2-theta."""
+    theta = np.deg2rad(two_theta_deg / 2.0)
+    beta_rad = (K * (wavelength_a * 0.1)) / (crystallite_nm * np.cos(theta))  # nm-> A handled
+    # Convert to deg 2theta. (Approximation; constants absorbed for benchmark stylization.)
+    return float(np.rad2deg(beta_rad))
 
 
-def render_lack_of_fusion(img, magnification, rng):
-    scale_factor = 500.0 / magnification
-    n_regions = int(rng.integers(2, 6))
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
-
-    for _ in range(n_regions):
-        cx = int(rng.integers(30, IMG_SIZE - 30))
-        cy = int(rng.integers(30, IMG_SIZE - 30))
-        length = rng.uniform(30, 80) * scale_factor
-        length = max(15, min(length, 150))
-        width = rng.uniform(5, 12) * scale_factor
-        width = max(3, min(width, 25))
-        angle = rng.uniform(0, 2 * np.pi)
-
-        dx = (xx - cx) * np.cos(angle) + (yy - cy) * np.sin(angle)
-        dy = -(xx - cx) * np.sin(angle) + (yy - cy) * np.cos(angle)
-        modulation = 1 + 0.3 * np.sin(dy * 0.1)
-        ellipse_dist = (dx / (length * modulation)) ** 2 + (dy / width) ** 2
-        region = np.exp(-ellipse_dist * 2) * rng.uniform(50, 80)
-        img -= region
-    return img
+def march_dollase(intensities: np.ndarray, two_thetas: np.ndarray, r: float) -> np.ndarray:
+    """Stylized preferred-orientation correction."""
+    # Use 2theta as a proxy for hkl angle; produces smooth angle-dependent rescale.
+    theta = np.deg2rad(two_thetas / 2.0)
+    factor = (r ** 2 * np.cos(theta) ** 2 + np.sin(theta) ** 2 / r) ** (-1.5)
+    return intensities * factor
 
 
-def render_keyholing(img, magnification, rng):
-    scale_factor = 500.0 / magnification
-    n_keyholes = int(rng.integers(1, 4))
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
-
-    for _ in range(n_keyholes):
-        cx = int(rng.integers(40, IMG_SIZE - 40))
-        cy = int(rng.integers(40, IMG_SIZE - 40))
-        depth = rng.uniform(40, 80) * scale_factor
-        depth = max(20, min(depth, 120))
-        top_width = rng.uniform(8, 15) * scale_factor
-        top_width = max(4, min(top_width, 25))
-
-        dy = yy - cy
-        dx = xx - cx
-        mask = dy >= 0
-        local_width = top_width * (1 - 0.7 * np.clip(dy / depth, 0, 1))
-        local_width = np.maximum(local_width, 2)
-        keyhole_dist = (dx / local_width) ** 2 + (dy / depth) ** 2
-        keyhole = np.exp(-keyhole_dist * 3) * rng.uniform(60, 90)
-        keyhole[~mask] *= 0.3
-        img -= keyhole
-    return img
+def displacement_shift(two_theta: np.ndarray, s: float, R: float = 240.0) -> np.ndarray:
+    """Sample displacement error: nonlinear angle-dependent 2theta shift in deg."""
+    return -2.0 * s / R * np.cos(np.deg2rad(two_theta / 2.0)) * (180.0 / np.pi)
 
 
-def render_balling(img, magnification, rng):
-    scale_factor = 500.0 / magnification
-    n_beads = int(rng.integers(5, 15))
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
+# ---------------------------------------------------------------------------
+# Per-phase pattern synthesis
+# ---------------------------------------------------------------------------
+def synthesize_phase(phase: str,
+                     crystallite_nm: float,
+                     pref_orient_r: float,
+                     zero_shift: float,
+                     displacement_s: float,
+                     rng: np.random.Generator) -> np.ndarray:
+    pattern = np.zeros_like(GRID)
+    for center, rel_i in PEAKS[phase]:
+        # Drift the center: zero shift + sample displacement
+        center_drifted = center + zero_shift
+        center_drifted = center_drifted + displacement_shift(
+            np.array([center_drifted]), displacement_s)[0]
+        # Broadening: Scherrer (size) + small instrumental floor
+        fwhm = max(0.08, scherrer_fwhm(center, crystallite_nm) + 0.05)
+        eta = float(rng.uniform(0.2, 0.7))
+        # Per-peak intensity jitter to avoid memorizable exact ratios
+        jitter = float(rng.uniform(0.85, 1.15))
+        pattern += rel_i * jitter * pseudo_voigt(GRID, center_drifted, fwhm, eta)
+    # Preferred orientation rescale
+    pattern = march_dollase(pattern, GRID, pref_orient_r)
+    # Normalize per-phase to unit max so mass fractions translate to amplitude
+    if pattern.max() > 0:
+        pattern /= pattern.max()
+    return pattern
 
-    for _ in range(n_beads):
-        cx = int(rng.integers(15, IMG_SIZE - 15))
-        cy = int(rng.integers(15, IMG_SIZE - 15))
-        radius = rng.uniform(8, 18) * scale_factor
-        radius = max(4, min(radius, 35))
-        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-        bead = np.where(
-            dist < radius,
-            30 * np.cos(np.pi * dist / (2 * radius)) + 20,
-            0
+
+def synthesize_amorphous(rng: np.random.Generator) -> np.ndarray:
+    halo_center = float(rng.uniform(15.0, 25.0))
+    halo_width = float(rng.uniform(8.0, 14.0))
+    halo = np.exp(-0.5 * ((GRID - halo_center) / halo_width) ** 2)
+    # Optional second broad bump
+    if rng.random() < 0.5:
+        c2 = float(rng.uniform(35.0, 45.0))
+        w2 = float(rng.uniform(10.0, 18.0))
+        halo += 0.4 * np.exp(-0.5 * ((GRID - c2) / w2) ** 2)
+    halo /= halo.max()
+    return halo
+
+
+# ---------------------------------------------------------------------------
+# Mixture + acquisition artifacts
+# ---------------------------------------------------------------------------
+def sample_phase_fractions(rng: np.random.Generator) -> np.ndarray:
+    """Dirichlet draw, with a small chance of a near-pure phase."""
+    if rng.random() < 0.15:
+        # Near-pure: spike one phase
+        idx = rng.integers(0, 4)
+        alpha = np.full(4, 0.5)
+        alpha[idx] = 12.0
+    else:
+        alpha = rng.uniform(0.4, 2.5, size=4)
+    f = rng.dirichlet(alpha)
+    return f.astype(np.float64)
+
+
+def acquisition_params(regime: str, rng: np.random.Generator) -> dict:
+    if regime == "sim_A":
+        return dict(
+            zero_shift=float(rng.uniform(-0.10, 0.10)),
+            displacement_s=float(rng.uniform(-0.10, 0.10)),
+            pref_orient_r=float(rng.uniform(0.85, 1.15)),
+            bg_slope=float(rng.uniform(-2.0, 4.0)),
+            bg_intercept=float(rng.uniform(2.0, 8.0)),
+            counts_scale=float(rng.uniform(800, 1500)),
         )
-        ring = np.exp(-((dist - radius) / 3) ** 2) * 20
-        img += bead - ring
-    return img
+    else:  # sim_B: harsher
+        return dict(
+            zero_shift=float(rng.uniform(-0.30, 0.30)),
+            displacement_s=float(rng.uniform(-0.25, 0.25)),
+            pref_orient_r=float(rng.uniform(0.70, 1.35)),
+            bg_slope=float(rng.uniform(-5.0, 10.0)),
+            bg_intercept=float(rng.uniform(3.0, 15.0)),
+            counts_scale=float(rng.uniform(300, 900)),
+        )
 
 
-def render_spatter(img, magnification, rng):
-    scale_factor = 500.0 / magnification
-    n_particles = int(rng.integers(20, 60))
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
+def build_pattern(fractions: np.ndarray,
+                  crystallite_nm: float,
+                  acq: dict,
+                  rng: np.random.Generator) -> np.ndarray:
+    f_alpha, f_beta, f_gamma, f_amorph = fractions
+    p_a = synthesize_phase("alpha", crystallite_nm, acq["pref_orient_r"],
+                           acq["zero_shift"], acq["displacement_s"], rng)
+    p_b = synthesize_phase("beta", crystallite_nm, 1.0 / acq["pref_orient_r"],
+                           acq["zero_shift"], acq["displacement_s"], rng)
+    p_g = synthesize_phase("gamma", crystallite_nm, acq["pref_orient_r"] ** 0.5,
+                           acq["zero_shift"], acq["displacement_s"], rng)
+    p_m = synthesize_amorphous(rng)
 
-    for _ in range(n_particles):
-        cx = int(rng.integers(0, IMG_SIZE))
-        cy = int(rng.integers(0, IMG_SIZE))
-        radius = rng.uniform(1, 4) * scale_factor
-        radius = max(1, min(radius, 8))
-        brightness = rng.uniform(30, 60)
-        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-        particle = np.exp(-(dist / radius) ** 2) * brightness
-        img += particle
-    return img
+    pattern = f_alpha * p_a + f_beta * p_b + f_gamma * p_g + f_amorph * p_m
 
+    # Linear background drift
+    bg = acq["bg_intercept"] + acq["bg_slope"] * (GRID - GRID.mean()) / (GRID.max() - GRID.min())
+    bg = np.clip(bg, 0.0, None)
+    pattern = pattern * acq["counts_scale"] + bg
 
-def render_delamination(img, magnification, rng):
-    scale_factor = 500.0 / magnification
-    n_cracks = int(rng.integers(1, 3))
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
+    # Poisson counting noise
+    pattern = rng.poisson(np.clip(pattern, 0.0, None)).astype(np.float32)
 
-    for _ in range(n_cracks):
-        y_pos = int(rng.integers(50, IMG_SIZE - 50))
-        crack_length = rng.uniform(200, 400) * scale_factor
-        crack_length = min(crack_length, IMG_SIZE - 20)
-        crack_width = rng.uniform(2, 5) * scale_factor
-        crack_width = max(1, min(crack_width, 8))
-
-        wave = rng.normal(0, 3, IMG_SIZE).cumsum()
-        wave = wave - wave.mean()
-        wave = np.clip(wave, -10, 10)
-
-        crack_y = y_pos + wave[np.newaxis, :]
-        crack_dist = np.abs(yy - crack_y)
-        crack = np.exp(-(crack_dist / crack_width) ** 2) * rng.uniform(60, 90)
-
-        x_center = IMG_SIZE / 2.0
-        length_mask = np.exp(-((xx - x_center) / (crack_length / 2)) ** 2)
-        crack *= length_mask
-        img -= crack
-    return img
+    # Tiny residual smoothing to mimic detector response
+    pattern = gaussian_filter1d(pattern, sigma=0.6).astype(np.float32)
+    return pattern
 
 
-DEFECT_RENDERERS = {
-    0: render_porosity,
-    1: render_lack_of_fusion,
-    2: render_keyholing,
-    3: render_balling,
-    4: render_spatter,
-    5: render_delamination,
-}
+# ---------------------------------------------------------------------------
+# Reference patterns (clean, no drift, no noise)
+# ---------------------------------------------------------------------------
+def build_reference(phase: str) -> np.ndarray:
+    rng = np.random.default_rng(0)  # deterministic, no jitter
+    pattern = np.zeros_like(GRID)
+    for center, rel_i in PEAKS[phase]:
+        fwhm = 0.10
+        pattern += rel_i * pseudo_voigt(GRID, center, fwhm, eta=0.5)
+    if pattern.max() > 0:
+        pattern /= pattern.max()
+    return pattern.astype(np.float32)
 
 
-# ============================================================
-# Illumination Model
-# ============================================================
-
-def apply_illumination(img, illumination, rng):
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
-
-    if illumination == 'bright_field':
-        gradient_angle = rng.uniform(0, 2 * np.pi)
-        gradient = (xx * np.cos(gradient_angle) + yy * np.sin(gradient_angle)) / IMG_SIZE
-        img += gradient * 15
-
-    elif illumination == 'dark_field':
-        cy, cx = IMG_SIZE / 2.0, IMG_SIZE / 2.0
-        dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-        ring = (dist / (IMG_SIZE * 0.5)) ** 2 * 25
-        img = img * 0.7 + ring
-
-    elif illumination == 'mixed':
-        split_pos = int(rng.integers(IMG_SIZE // 4, 3 * IMG_SIZE // 4))
-        split_angle = rng.uniform(0, 2 * np.pi)
-        threshold = xx * np.cos(split_angle) + yy * np.sin(split_angle)
-        mask = threshold > split_pos
-        img = img.copy()
-        img[~mask] *= 0.6
-
-    return np.clip(img, 0, 255)
+def build_reference_amorphous() -> np.ndarray:
+    halo = np.exp(-0.5 * ((GRID - 20.0) / 10.0) ** 2)
+    halo /= halo.max()
+    return halo.astype(np.float32)
 
 
-# ============================================================
-# Post-Processing
-# ============================================================
-
-def apply_magnification_effects(img, magnification, rng):
-    if magnification == 500:
-        img += rng.normal(0, 3, img.shape).astype(np.float32)
-    elif magnification == 200:
-        img = cv2.GaussianBlur(img, (3, 3), 0.5)
-    elif magnification == 50:
-        img = cv2.GaussianBlur(img, (5, 5), 1.0)
-    return img
-
-
-def add_polishing_artifacts(img, rng):
-    if rng.random() < POLISHING_ARTIFACT_RATE:
-        start_x = int(rng.integers(0, IMG_SIZE))
-        start_y = int(rng.integers(0, IMG_SIZE))
-        length = int(rng.integers(100, 300))
-        angle = rng.uniform(0, 2 * np.pi)
-        thickness = int(rng.integers(1, 3))
-
-        end_x = int(np.clip(start_x + length * np.cos(angle), 0, IMG_SIZE - 1))
-        end_y = int(np.clip(start_y + length * np.sin(angle), 0, IMG_SIZE - 1))
-
-        scratch_img = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
-        cv2.line(scratch_img, (start_x, start_y), (end_x, end_y), 1.0, thickness)
-        scratch_img = cv2.GaussianBlur(scratch_img, (5, 5), 1.0)
-
-        if rng.random() < 0.5:
-            img += scratch_img * 30
-        else:
-            img -= scratch_img * 30
-    return img
-
-
-def add_sensor_noise(img, material, rng):
-    params = MATERIAL_PARAMS[material]
-    img += rng.normal(0, params['noise_std'], img.shape).astype(np.float32)
-
-    yy, xx = np.mgrid[0:IMG_SIZE, 0:IMG_SIZE]
-    cy, cx = IMG_SIZE / 2.0, IMG_SIZE / 2.0
-    dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    vignette = 1 - 0.15 * (dist / (IMG_SIZE * 0.5)) ** 2
-    img *= vignette
-    return np.clip(img, 0, 255)
-
-
-# ============================================================
-# Confounder Sampling
-# ============================================================
-
-def sample_confounders(label, rng):
-    material_probs = np.array([0.34, 0.33, 0.33])
-    mag_probs = np.array([0.34, 0.33, 0.33])
-    illum_probs = np.array([0.34, 0.33, 0.33])
-
-    if label == 0:
-        material_probs = np.array([0.60, 0.20, 0.20])
-    elif label == 1:
-        material_probs = np.array([0.20, 0.60, 0.20])
-
-    if label == 4:
-        mag_probs = np.array([0.20, 0.20, 0.60])
-    elif label == 5:
-        mag_probs = np.array([0.60, 0.20, 0.20])
-
-    if label == 6:
-        illum_probs = np.array([0.60, 0.20, 0.20])
-
-    material = MATERIALS[int(rng.choice(3, p=material_probs))]
-    magnification = MAGNIFICATIONS[int(rng.choice(3, p=mag_probs))]
-    illumination = ILLUMINATIONS[int(rng.choice(3, p=illum_probs))]
-    return material, magnification, illumination
-
-
-# ============================================================
-# Single Image Generation
-# ============================================================
-
-def generate_single_image(label, rng):
-    material, magnification, illumination = sample_confounders(label, rng)
-    img = render_base_microstructure(material, magnification, rng)
-
-    if label == 7:
-        available = list(DEFECT_RENDERERS.keys())
-        n_defects = int(rng.integers(2, min(4, len(available) + 1)))
-        chosen = rng.choice(available, size=n_defects, replace=False)
-        for d in chosen:
-            img = DEFECT_RENDERERS[int(d)](img, magnification, rng)
-    elif label in DEFECT_RENDERERS:
-        img = DEFECT_RENDERERS[label](img, magnification, rng)
-
-    img = apply_illumination(img, illumination, rng)
-    img = apply_magnification_effects(img, magnification, rng)
-    img = add_polishing_artifacts(img, rng)
-    img = add_sensor_noise(img, material, rng)
-    img = np.clip(img, 0, 255).astype(np.uint8)
-    return img, material, magnification, illumination
-
-
-# ============================================================
-# Requirements File Content
-# ============================================================
-
-REQUIREMENTS_TXT = """numpy>=1.24
-Pillow>=10.0
-opencv-python>=4.8
-pandas>=2.0
-"""
-
-
-# ============================================================
-# Dataset Description Markdown
-# ============================================================
-
-DATASET_DESCRIPTION = """# Dataset Description
-
-## Overview
-
-AM-Defect-2K is a fully synthetic dataset of 2,000 grayscale micrographs (512x512 px, PNG) simulating optical microscopy of polished cross-sections from laser powder-bed fusion (LPBF) additive manufacturing builds. Each image depicts a microstructure region that may contain one of six defect types, no defect, or a co-occurrence of multiple defect types. The dataset is stratified across three confounder axes -- material alloy, optical magnification, and simulated illumination -- whose distributions vary across defect classes, reflecting natural biases in real-world AM data collection.
-
-This dataset is 100% synthetically generated using a procedural pipeline that renders physically-inspired microstructures (Voronoi grain boundaries, melt-pool patterns) and parametric defect morphologies. The generation script (`generate.py`) is included in the archive and is fully reproducible with a hardcoded random seed (42). No external or third-party data was used.
-
-## File Structure
-
-```
-am_defect_2k/
-├── generate.py          # Fully reproducible synthesis script
-├── requirements.txt     # Python dependencies
-└── raw/
-    ├── metadata.csv     # Image metadata and labels (2000 rows)
-    └── images/
-        ├── 00000.png
-        ├── 00001.png
-        ├── ...
-        └── 01999.png
-```
-
-## Features
-
-| Column | Type | Description |
-|--------|------|-------------|
-| `image_id` | `str` | Unique identifier (5-digit zero-padded), maps to `{image_id}.png` |
-| `material` | `str` | Alloy code: `Ti64` (Ti-6Al-4V), `IN718` (Inconel 718), `AlSi` (AlSi10Mg) |
-| `magnification` | `int` | Objective magnification: `50`, `200`, or `500` |
-| `illumination` | `str` | Illumination mode: `bright_field`, `dark_field`, or `mixed` |
-| `label` | `int` | Defect class (0-7), see class table below |
-
-### Defect Classes
-
-| Class ID | Label | Description |
-|----------|-------|-------------|
-| 0 | `porosity` | Small, near-circular dark voids (10-40 um apparent diameter) |
-| 1 | `lack_of_fusion` | Irregular elongated dark regions at melt-pool boundaries |
-| 2 | `keyholing` | Deep, narrow keyhole-shaped voids with tapered profile |
-| 3 | `balling` | Spherical bead clusters on the surface |
-| 4 | `spatter` | Small bright particulate ejecta scattered across field |
-| 5 | `delamination` | Horizontal crack-like separations between layers |
-| 6 | `no_defect` | Clean, well-formed melt-pool microstructure |
-| 7 | `multi_defect` | Co-occurrence of 2 or more of the above defect types |
-
-### Contextual Notes
-
-- **Image format**: Grayscale PNG, 512x512 pixels, 8-bit depth
-- **Material variation**: Each alloy (Ti64, IN718, AlSi) exhibits distinct grain size distributions, base intensity, contrast, and sensor noise characteristics
-- **Magnification effects**: Higher magnification (500x) increases apparent defect size and fine detail; lower magnification (50x) introduces blur and reduces visible field of view
-- **Illumination modes**: Bright-field (uniform with slight directional gradient), dark-field (inverted ring pattern with darker center), and mixed (partial illumination with one half darkened) significantly alter defect visibility and contrast
-- **Controlled complexities**: The dataset includes simulated polishing artifacts (streaks/scratches) in approximately 3% of images, and natural parameter variation in defect renderers creates borderline cases where defect severity is near the classification threshold
-- **Reproducibility**: The entire dataset is regenerated by running `python generate.py --output_dir ./am_defect_2k --n_images 2000 --seed 42`
-"""
-
-
-# ============================================================
-# Main Pipeline
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description='Generate AM-Defect-2K synthetic dataset'
-    )
-    parser.add_argument(
-        '--output_dir', type=str, default='./am_defect_2k',
-        help='Output directory for dataset (default: ./am_defect_2k)'
-    )
-    parser.add_argument(
-        '--n_images', type=int, default=N_IMAGES,
-        help=f'Number of images to generate (default: {N_IMAGES})'
-    )
-    parser.add_argument(
-        '--seed', type=int, default=SEED,
-        help=f'Random seed for reproducibility (default: {SEED})'
-    )
-    parser.add_argument(
-        '--no_zip', action='store_true',
-        help='Skip ZIP creation'
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n", type=int, default=12000)
+    parser.add_argument("--out", type=str, default="./polydrift_xrd_raw")
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
-    images_dir = output_dir / 'raw' / 'images'
-    raw_dir = output_dir / 'raw'
+    out = Path(args.out)
+    (out / "patterns").mkdir(parents=True, exist_ok=True)
+    (out / "reference").mkdir(parents=True, exist_ok=True)
+    (out / "generation").mkdir(parents=True, exist_ok=True)
 
-    # Clean existing directory
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    images_dir.mkdir(parents=True, exist_ok=True)
+    master = np.random.default_rng(args.seed)
 
-    # Seed both legacy and modern RNG for full determinism
-    np.random.seed(args.seed)
-    rng = np.random.default_rng(args.seed)
+    # Reference patterns
+    np.save(out / "reference" / "alpha.npy", build_reference("alpha"))
+    np.save(out / "reference" / "beta.npy", build_reference("beta"))
+    np.save(out / "reference" / "gamma.npy", build_reference("gamma"))
+    np.save(out / "reference" / "amorphous.npy", build_reference_amorphous())
 
-    print("=" * 60)
-    print("AM-Defect-2K: Synthetic AM Defect Micrograph Generator")
-    print("=" * 60)
-    print(f"  Output directory : {output_dir.resolve()}")
-    print(f"  Total images     : {args.n_images}")
-    print(f"  Image size       : {IMG_SIZE}x{IMG_SIZE} grayscale")
-    print(f"  Random seed      : {args.seed}")
-    print(f"  Classes          : {len(CLASS_NAMES)}")
-    print("=" * 60)
-    print()
+    rows = []
+    for i in range(args.n):
+        # Per-sample RNG seeded from master => fully reproducible regardless of order
+        sub_seed = int(master.integers(0, 2**31 - 1))
+        rng = np.random.default_rng(sub_seed)
 
-    # Sample labels from class prior
-    class_ids = list(CLASS_PRIOR.keys())
-    class_probs = list(CLASS_PRIOR.values())
-    raw_labels = rng.choice(class_ids, size=args.n_images, p=class_probs)
+        # Deterministic UUID from sub_seed for stable filenames across reruns
+        sample_id = uuid.UUID(int=(sub_seed << 96) | (i & 0xFFFFFFFF) & ((1 << 128) - 1)).hex[:16]
 
-    metadata = []
+        regime = "sim_A" if rng.random() < 0.55 else "sim_B"
+        acq = acquisition_params(regime, rng)
+        crystallite_nm = float(rng.uniform(15.0, 200.0))
+        fractions = sample_phase_fractions(rng)
 
-    for i in range(args.n_images):
-        label = int(raw_labels[i])
-        img, material, magnification, illumination = generate_single_image(label, rng)
+        pattern = build_pattern(fractions, crystallite_nm, acq, rng)
+        np.save(out / "patterns" / f"{sample_id}.npy", pattern)
 
-        img_id = f"{i:05d}"
-        img_path = images_dir / f"{img_id}.png"
-        Image.fromarray(img, mode='L').save(img_path)
-
-        metadata.append({
-            'image_id': img_id,
-            'material': material,
-            'magnification': magnification,
-            'illumination': illumination,
-            'label': label
+        rows.append({
+            "sample_id": sample_id,
+            "f_alpha": float(fractions[0]),
+            "f_beta": float(fractions[1]),
+            "f_gamma": float(fractions[2]),
+            "f_amorphous": float(fractions[3]),
+            "zero_shift": acq["zero_shift"],
+            "crystallite_nm": crystallite_nm,
+            "acquisition": regime,
         })
 
-        if (i + 1) % 200 == 0:
-            pct = (i + 1) / args.n_images * 100
-            print(f"  [{pct:5.1f}%] Generated {i + 1}/{args.n_images} images")
+    df = pd.DataFrame(rows).sort_values("sample_id").reset_index(drop=True)
+    csv_path = out / "data.csv"
+    df.to_csv(csv_path, index=False, float_format="%.8f", lineterminator="\n")
 
-    # Save metadata
-    df = pd.DataFrame(metadata)
-    metadata_path = raw_dir / 'metadata.csv'
-    df.to_csv(metadata_path, index=False)
+    # Copy this script into the generation/ folder for provenance
+    this_file = Path(__file__).resolve()
+    (out / "generation" / "generate.py").write_bytes(this_file.read_bytes())
 
-    print()
-    print("-" * 60)
-    print("GENERATION COMPLETE")
-    print("-" * 60)
-
-    # Print class distribution
-    print()
-    print("Class Distribution:")
-    for cls_id, cls_name in CLASS_NAMES.items():
-        count = int((df['label'] == cls_id).sum())
-        pct = count / args.n_images * 100
-        bar = '#' * int(pct / 2)
-        print(f"  {cls_id} {cls_name:<16s} {count:5d}  ({pct:4.1f}%)  {bar}")
-
-    # Print confounder distributions
-    print()
-    print("Material Distribution:")
-    for mat in MATERIALS:
-        count = int((df['material'] == mat).sum())
-        pct = count / args.n_images * 100
-        print(f"  {mat:<8s} {count:5d}  ({pct:4.1f}%)")
-
-    print()
-    print("Magnification Distribution:")
-    for mag in MAGNIFICATIONS:
-        count = int((df['magnification'] == mag).sum())
-        pct = count / args.n_images * 100
-        print(f"  {mag:>4d}x   {count:5d}  ({pct:4.1f}%)")
-
-    print()
-    print("Illumination Distribution:")
-    for illum in ILLUMINATIONS:
-        count = int((df['illumination'] == illum).sum())
-        pct = count / args.n_images * 100
-        print(f"  {illum:<14s} {count:5d}  ({pct:4.1f}%)")
-
-    # Copy generate.py and requirements.txt into output directory
-    script_path = Path(__file__).resolve()
-    shutil.copy2(script_path, output_dir / 'generate.py')
-
-    req_path = output_dir / 'requirements.txt'
-    req_path.write_text(REQUIREMENTS_TXT)
-
-    # Write dataset description
-    desc_path = output_dir / 'DATASET_DESCRIPTION.md'
-    desc_path.write_text(DATASET_DESCRIPTION)
-
-    print()
-    print("-" * 60)
-    print("FILES WRITTEN:")
-    print(f"  {output_dir / 'generate.py'}")
-    print(f"  {output_dir / 'requirements.txt'}")
-    print(f"  {output_dir / 'DATASET_DESCRIPTION.md'}")
-    print(f"  {metadata_path}")
-    print(f"  {images_dir}/  ({args.n_images} PNG files)")
-
-    # Calculate total size
-    total_size = sum(
-        f.stat().st_size for f in output_dir.rglob('*') if f.is_file()
+    # LICENSE
+    (out / "LICENSE.md").write_text(
+        "PolyDrift-XRD is released under CC BY 4.0.\n"
+        "Reference structure provenance: COD entries 1010368, 1011000, 1528823 (CC0).\n",
+        encoding="utf-8",
     )
-    size_mb = total_size / (1024 * 1024)
-    print(f"  Total size: {size_mb:.1f} MB")
 
-    # Create ZIP archive
-    if not args.no_zip:
-        print()
-        print("-" * 60)
-        print("Creating ZIP archive...")
-
-        zip_base = str(output_dir.resolve())
-        zip_path = shutil.make_archive(
-            base_name=zip_base,
-            format='zip',
-            root_dir=str(output_dir.parent.resolve()),
-            base_dir=output_dir.name
-        )
-
-        zip_size = os.path.getsize(zip_path) / (1024 * 1024)
-        print(f"  ZIP created: {zip_path}")
-        print(f"  ZIP size: {zip_size:.1f} MB")
-
-    print()
-    print("=" * 60)
-    print("ALL DONE!")
-    if not args.no_zip:
-        print(f"  Upload this file to Eris: {zip_path}")
-    print("=" * 60)
+    # Reproducibility hash
+    sha = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    manifest = {
+        "seed": args.seed,
+        "n_samples": args.n,
+        "n_points_per_pattern": N_POINTS,
+        "two_theta_range_deg": [TWO_THETA_MIN, TWO_THETA_MAX],
+        "data_csv_sha256": sha,
+    }
+    (out / "generation" / "manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8"
+    )
+    print(json.dumps(manifest, indent=2))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
