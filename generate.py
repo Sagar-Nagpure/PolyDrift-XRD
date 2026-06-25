@@ -1,307 +1,409 @@
+"""generate.py — OrbitMosaic v4 local generator.
+
+Usage:
+    pip install numpy pandas pillow scikit-learn
+    python generate.py --n 8000 --out ./orbitmosaic_raw
 """
-PolyDrift-XRD: deterministic synthetic powder XRD dataset generator.
-
-Reproducibility:
-    python generate.py --seed 42 --out ./polydrift_xrd_raw
-
-Provenance of reference structures (Crystallography Open Database, CC0):
-    alpha   : COD 1010368  (orthorhombic reference)
-    beta    : COD 1011000  (monoclinic  reference)
-    gamma   : COD 1528823  (triclinic   reference)
-    amorphous: synthetic broad-halo model (no crystalline reference)
-
-NOTE: The peak lists below are *stylized* approximations chosen so the three
-crystalline phases share most low-angle peaks and differ mainly in intensity
-ratios and high-angle fingerprints. This is intentional: the benchmark tests
-mixture quantification under overlap, not phase ID from disjoint peak sets.
-
-License: CC BY 4.0
-"""
-
-from __future__ import annotations
-import argparse
-import hashlib
-import json
-import uuid
+import argparse, hashlib, hmac, io, json
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
-from scipy.ndimage import gaussian_filter1d
+from PIL import Image, ImageDraw, ImageFilter
 
-# ---------------------------------------------------------------------------
-# Global grid
-# ---------------------------------------------------------------------------
-TWO_THETA_MIN = 5.0
-TWO_THETA_MAX = 90.0
-N_POINTS = 4000
-GRID = np.linspace(TWO_THETA_MIN, TWO_THETA_MAX, N_POINTS, dtype=np.float64)
-STEP = GRID[1] - GRID[0]  # ~0.02125 deg
+SEED = 0xC0FFEE17
+ID_SECRET = b"orbitmosaic_v4::token_salt::9f2a"
+MOSAIC_W = MOSAIC_H = 384
+TILE_S = 128
+TILE_GRID = (3, 3)
+N_TILES = 9
+N_DROPOUT = 4
+OCC = 16
+N_OCC = 3
 
-# ---------------------------------------------------------------------------
-# Stylized peak lists: (2theta_deg, relative_intensity)
-# Deliberately overlapping in 5-40 deg; fingerprint peaks live above 40 deg.
-# ---------------------------------------------------------------------------
-PEAKS = {
-    "alpha": [
-        (8.42, 1.00), (12.65, 0.55), (16.88, 0.40), (21.10, 0.72),
-        (25.32, 0.30), (29.55, 0.48), (33.78, 0.22), (44.10, 0.62),
-        (52.40, 0.35), (61.18, 0.28), (74.55, 0.18),
-    ],
-    "beta": [
-        (8.55, 0.95), (12.70, 0.80), (17.05, 0.25), (21.22, 0.60),
-        (25.40, 0.50), (29.61, 0.30), (33.90, 0.45), (47.85, 0.70),
-        (55.20, 0.40), (66.30, 0.25), (78.10, 0.20),
-    ],
-    "gamma": [
-        (8.48, 0.70), (12.60, 0.65), (16.95, 0.55), (21.15, 0.85),
-        (25.36, 0.42), (29.58, 0.60), (33.84, 0.38), (50.95, 0.55),
-        (58.40, 0.48), (69.75, 0.30), (82.40, 0.22),
-    ],
+LUT_FAMILY = [
+    dict(r=(0.267, 0.005, 1.247, -0.520), g=(0.005, 1.404, -0.490, 0.084),
+         b=(0.329, 1.385, -2.560, 1.146)),
+    dict(r=(0.040, 2.100, -1.200, 0.080), g=(0.020, 0.300, 1.400, -0.700),
+         b=(0.020, 0.100, 0.400, 0.500)),
+    dict(r=(0.000, 0.200, 0.500, 0.300), g=(0.000, 1.300, -0.500, 0.200),
+         b=(0.300, 1.400, -1.200, 0.500)),
+    dict(r=(0.000, 1.000, 0.000, 0.000), g=(0.000, 1.000, 0.000, 0.000),
+         b=(0.000, 1.000, 0.000, 0.000)),
+    dict(r=(0.001, 0.700, 1.500, -1.200), g=(0.000, 0.100, 0.300, 0.600),
+         b=(0.015, 1.700, -2.300, 1.600)),
+    dict(r=(0.050, 2.300, -1.800, 0.450), g=(0.030, 0.100, 0.700, 0.170),
+         b=(0.530, 0.500, -1.000, 0.000)),
+    dict(r=(0.200, 0.400, 0.300, 0.100), g=(0.100, 0.900, -0.200, 0.200),
+         b=(0.050, 0.600, 0.300, 0.050)),
+    dict(r=(0.500, -0.300, 1.000, -0.200), g=(0.300, 0.500, 0.300, -0.100),
+         b=(0.100, 0.300, 0.700, -0.100)),
+    dict(r=(0.100, 0.800, 0.200, -0.100), g=(0.400, -0.200, 1.100, -0.300),
+         b=(0.700, -0.500, 0.500, 0.300)),
+    dict(r=(0.300, 1.100, -0.700, 0.300), g=(0.150, 0.300, 0.900, -0.300),
+         b=(0.250, 0.700, -0.400, 0.400)),
+]
+
+# Tightened regime bands — adjacent regimes share visual cues.
+REGIMES = {
+    0: [{"a": (1.02, 1.10), "b": (0.28, 0.32)},
+        {"a": (1.10, 1.20), "b": (0.28, 0.32)},
+        {"a": (1.20, 1.28), "b": (0.28, 0.32)},
+        {"a": (1.28, 1.40), "b": (0.28, 0.32)}],
+    1: [{"a": (1.42, 1.55), "b": (0.30, 0.40)},
+        {"a": (1.55, 1.65), "b": (0.30, 0.40)},
+        {"a": (1.65, 1.74), "b": (0.30, 0.40)},
+        {"a": (1.74, 1.85), "b": (0.30, 0.40)}],
+    2: [{"K": (0.20, 0.60)}, {"K": (0.60, 0.97)},
+        {"K": (0.97, 1.50)}, {"K": (1.50, 2.50)}],
+    3: [{"c1": (0.85, 0.88), "c2": (-0.65, -0.60),
+         "c3": (1.95, 2.00), "c4": (0.45, 0.50)},
+        {"c1": (0.88, 0.90), "c2": (-0.60, -0.58),
+         "c3": (2.00, 2.03), "c4": (0.50, 0.52)},
+        {"c1": (0.90, 0.92), "c2": (-0.58, -0.56),
+         "c3": (2.03, 2.05), "c4": (0.52, 0.54)},
+        {"c1": (0.92, 0.95), "c2": (-0.56, -0.55),
+         "c3": (2.05, 2.05), "c4": (0.54, 0.55)}],
+    4: [{"u": (0.82, 0.86)}, {"u": (0.86, 0.89)},
+        {"u": (0.89, 0.92)}, {"u": (0.92, 0.95)}],
+    5: [{"_ic_band": (0, 1)}, {"_ic_band": (1, 2)},
+        {"_ic_band": (2, 3)}, {"_ic_band": (3, 4)}],
 }
-PHASES_CRYST = ["alpha", "beta", "gamma"]
 
 
-# ---------------------------------------------------------------------------
-# Physics-flavored building blocks
-# ---------------------------------------------------------------------------
-def pseudo_voigt(x: np.ndarray, center: float, fwhm: float, eta: float) -> np.ndarray:
-    """Normalized pseudo-Voigt (linear combo of Gaussian + Lorentzian)."""
-    sigma = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-    gauss = np.exp(-0.5 * ((x - center) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
-    gamma = fwhm / 2.0
-    lorentz = (gamma / np.pi) / ((x - center) ** 2 + gamma ** 2)
-    return eta * lorentz + (1.0 - eta) * gauss
+def _opaque_id(idx):
+    return hmac.new(ID_SECRET, f"om4::{idx}".encode(),
+                    hashlib.sha256).hexdigest()[:12]
 
 
-def scherrer_fwhm(two_theta_deg: float, crystallite_nm: float,
-                  wavelength_a: float = 1.5406, K: float = 0.9) -> float:
-    """Scherrer broadening in degrees 2-theta."""
-    theta = np.deg2rad(two_theta_deg / 2.0)
-    beta_rad = (K * (wavelength_a * 0.1)) / (crystallite_nm * np.cos(theta))  # nm-> A handled
-    # Convert to deg 2theta. (Approximation; constants absorbed for benchmark stylization.)
-    return float(np.rad2deg(beta_rad))
+def _rng(idx, tag):
+    h = hashlib.sha256(f"{tag}::{idx}".encode()).digest()
+    s = int.from_bytes(h[:8], "big") ^ SEED
+    return np.random.default_rng(s & 0x7FFFFFFFFFFFFFFF)
 
 
-def march_dollase(intensities: np.ndarray, two_thetas: np.ndarray, r: float) -> np.ndarray:
-    """Stylized preferred-orientation correction."""
-    # Use 2theta as a proxy for hkl angle; produces smooth angle-dependent rescale.
-    theta = np.deg2rad(two_thetas / 2.0)
-    factor = (r ** 2 * np.cos(theta) ** 2 + np.sin(theta) ** 2 / r) ** (-1.5)
-    return intensities * factor
+def _sample_params(rng, m, regime):
+    band = REGIMES[m][regime]
+    params = {}
+    for k, v in band.items():
+        if k.startswith("_"): continue
+        params[k] = float(rng.uniform(v[0], v[1]))
+    return params
 
 
-def displacement_shift(two_theta: np.ndarray, s: float, R: float = 240.0) -> np.ndarray:
-    """Sample displacement error: nonlinear angle-dependent 2theta shift in deg."""
-    return -2.0 * s / R * np.cos(np.deg2rad(two_theta / 2.0)) * (180.0 / np.pi)
+def henon(x, y, p): return (1.0 - p["a"] * x * x + y, p["b"] * x)
+def lozi(x, y, p):  return (1.0 - p["a"] * abs(x) + y, p["b"] * x)
+def standard(x, y, p):
+    p_new = (y + p["K"] * np.sin(x)) % (2 * np.pi)
+    th_new = (x + p_new) % (2 * np.pi)
+    return (th_new, p_new)
+def tinkerbell(x, y, p):
+    return (x*x - y*y + p["c1"]*x + p["c2"]*y,
+            2*x*y + p["c3"]*x + p["c4"]*y)
+def ikeda(x, y, p):
+    t = 0.4 - 6.0 / (1.0 + x*x + y*y)
+    return (1.0 + p["u"] * (x * np.cos(t) - y * np.sin(t)),
+            p["u"] * (x * np.sin(t) + y * np.cos(t)))
+def gingerbread(x, y, p): return (1.0 - y + abs(x), x)
+
+MAP_FNS = [henon, lozi, standard, tinkerbell, ikeda, gingerbread]
+NATIVE = [(-1.6, 1.6, -0.5, 0.5),
+          (-1.6, 1.6, -0.6, 0.6),
+          (0.0, 2 * np.pi, 0.0, 2 * np.pi),
+          (-1.5, 1.5, -1.5, 1.5),
+          (-2.5, 2.5, -2.5, 2.5),
+          (-6.0, 6.0, -6.0, 6.0)]
 
 
-# ---------------------------------------------------------------------------
-# Per-phase pattern synthesis
-# ---------------------------------------------------------------------------
-def synthesize_phase(phase: str,
-                     crystallite_nm: float,
-                     pref_orient_r: float,
-                     zero_shift: float,
-                     displacement_s: float,
-                     rng: np.random.Generator) -> np.ndarray:
-    pattern = np.zeros_like(GRID)
-    for center, rel_i in PEAKS[phase]:
-        # Drift the center: zero shift + sample displacement
-        center_drifted = center + zero_shift
-        center_drifted = center_drifted + displacement_shift(
-            np.array([center_drifted]), displacement_s)[0]
-        # Broadening: Scherrer (size) + small instrumental floor
-        fwhm = max(0.08, scherrer_fwhm(center, crystallite_nm) + 0.05)
-        eta = float(rng.uniform(0.2, 0.7))
-        # Per-peak intensity jitter to avoid memorizable exact ratios
-        jitter = float(rng.uniform(0.85, 1.15))
-        pattern += rel_i * jitter * pseudo_voigt(GRID, center_drifted, fwhm, eta)
-    # Preferred orientation rescale
-    pattern = march_dollase(pattern, GRID, pref_orient_r)
-    # Normalize per-phase to unit max so mass fractions translate to amplitude
-    if pattern.max() > 0:
-        pattern /= pattern.max()
-    return pattern
+def _trajectory(m, params, n_iters, n_transient, rng, ic_band=0):
+    fn = MAP_FNS[m]
+    n_ic = int(rng.integers(3, 7))
+    xs, ys = [], []
+    for _ in range(n_ic):
+        if m == 2:
+            x0 = float(rng.uniform(0, 2 * np.pi))
+            y0 = float(rng.uniform(0, 2 * np.pi))
+        elif m == 5:
+            x0 = float(rng.uniform(-0.5 + ic_band, 0.5 + ic_band))
+            y0 = float(rng.uniform(-0.5 + ic_band, 0.5 + ic_band))
+        else:
+            x0 = float(rng.uniform(-0.5, 0.5))
+            y0 = float(rng.uniform(-0.5, 0.5))
+        x, y = x0, y0
+        for _ in range(n_transient):
+            x, y = fn(x, y, params)
+            if not (np.isfinite(x) and np.isfinite(y)) or abs(x) > 1e6 or abs(y) > 1e6:
+                x, y = 0.0, 0.0
+        per_ic = max(1, n_iters // n_ic)
+        for _ in range(per_ic):
+            x, y = fn(x, y, params)
+            if not (np.isfinite(x) and np.isfinite(y)) or abs(x) > 1e6 or abs(y) > 1e6:
+                break
+            xs.append(x); ys.append(y)
+    return np.array(xs, dtype=np.float64), np.array(ys, dtype=np.float64)
 
 
-def synthesize_amorphous(rng: np.random.Generator) -> np.ndarray:
-    halo_center = float(rng.uniform(15.0, 25.0))
-    halo_width = float(rng.uniform(8.0, 14.0))
-    halo = np.exp(-0.5 * ((GRID - halo_center) / halo_width) ** 2)
-    # Optional second broad bump
-    if rng.random() < 0.5:
-        c2 = float(rng.uniform(35.0, 45.0))
-        w2 = float(rng.uniform(10.0, 18.0))
-        halo += 0.4 * np.exp(-0.5 * ((GRID - c2) / w2) ** 2)
-    halo /= halo.max()
-    return halo
-
-
-# ---------------------------------------------------------------------------
-# Mixture + acquisition artifacts
-# ---------------------------------------------------------------------------
-def sample_phase_fractions(rng: np.random.Generator) -> np.ndarray:
-    """Dirichlet draw, with a small chance of a near-pure phase."""
-    if rng.random() < 0.15:
-        # Near-pure: spike one phase
-        idx = rng.integers(0, 4)
-        alpha = np.full(4, 0.5)
-        alpha[idx] = 12.0
+def _lyapunov(m, params, rng):
+    fn = MAP_FNS[m]
+    if m == 2:
+        x, y = float(rng.uniform(0, 2 * np.pi)), float(rng.uniform(0, 2 * np.pi))
     else:
-        alpha = rng.uniform(0.4, 2.5, size=4)
-    f = rng.dirichlet(alpha)
-    return f.astype(np.float64)
+        x, y = float(rng.uniform(-0.3, 0.3)), float(rng.uniform(-0.3, 0.3))
+    for _ in range(300):
+        x, y = fn(x, y, params)
+        if not (np.isfinite(x) and np.isfinite(y)) or abs(x) > 1e6:
+            return 0.0
+    eps = 1e-7; log_sum = 0.0; count = 0
+    for _ in range(400):
+        x1, y1 = fn(x + eps, y, params)
+        x2, y2 = fn(x, y + eps, params)
+        x_new, y_new = fn(x, y, params)
+        if not (np.isfinite(x_new) and np.isfinite(y_new)) or abs(x_new) > 1e6:
+            break
+        j = np.array([[(x1 - x_new) / eps, (x2 - x_new) / eps],
+                      [(y1 - y_new) / eps, (y2 - y_new) / eps]])
+        sv = np.linalg.svd(j, compute_uv=False)
+        if sv[0] > 0:
+            log_sum += np.log(sv[0]); count += 1
+        x, y = x_new, y_new
+    if count == 0: return 0.0
+    return log_sum / count
 
 
-def acquisition_params(regime: str, rng: np.random.Generator) -> dict:
-    if regime == "sim_A":
-        return dict(
-            zero_shift=float(rng.uniform(-0.10, 0.10)),
-            displacement_s=float(rng.uniform(-0.10, 0.10)),
-            pref_orient_r=float(rng.uniform(0.85, 1.15)),
-            bg_slope=float(rng.uniform(-2.0, 4.0)),
-            bg_intercept=float(rng.uniform(2.0, 8.0)),
-            counts_scale=float(rng.uniform(800, 1500)),
-        )
-    else:  # sim_B: harsher
-        return dict(
-            zero_shift=float(rng.uniform(-0.30, 0.30)),
-            displacement_s=float(rng.uniform(-0.25, 0.25)),
-            pref_orient_r=float(rng.uniform(0.70, 1.35)),
-            bg_slope=float(rng.uniform(-5.0, 10.0)),
-            bg_intercept=float(rng.uniform(3.0, 15.0)),
-            counts_scale=float(rng.uniform(300, 900)),
-        )
+def _classify_attractor(xs, ys, lyap):
+    if len(xs) < 50: return 0
+    pts = np.stack([xs[-min(2000, len(xs)):],
+                    ys[-min(2000, len(ys)):]], axis=1)
+    spread = np.std(pts, axis=0).mean()
+    if spread < 0.02: return 0
+    if lyap > 0.02: return 3
+    diffs = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
+    if np.median(diffs) > 0.5: return 1
+    return 2
 
 
-def build_pattern(fractions: np.ndarray,
-                  crystallite_nm: float,
-                  acq: dict,
-                  rng: np.random.Generator) -> np.ndarray:
-    f_alpha, f_beta, f_gamma, f_amorph = fractions
-    p_a = synthesize_phase("alpha", crystallite_nm, acq["pref_orient_r"],
-                           acq["zero_shift"], acq["displacement_s"], rng)
-    p_b = synthesize_phase("beta", crystallite_nm, 1.0 / acq["pref_orient_r"],
-                           acq["zero_shift"], acq["displacement_s"], rng)
-    p_g = synthesize_phase("gamma", crystallite_nm, acq["pref_orient_r"] ** 0.5,
-                           acq["zero_shift"], acq["displacement_s"], rng)
-    p_m = synthesize_amorphous(rng)
-
-    pattern = f_alpha * p_a + f_beta * p_b + f_gamma * p_g + f_amorph * p_m
-
-    # Linear background drift
-    bg = acq["bg_intercept"] + acq["bg_slope"] * (GRID - GRID.mean()) / (GRID.max() - GRID.min())
-    bg = np.clip(bg, 0.0, None)
-    pattern = pattern * acq["counts_scale"] + bg
-
-    # Poisson counting noise
-    pattern = rng.poisson(np.clip(pattern, 0.0, None)).astype(np.float32)
-
-    # Tiny residual smoothing to mimic detector response
-    pattern = gaussian_filter1d(pattern, sigma=0.6).astype(np.float32)
-    return pattern
+def _render_tile(xs, ys, framing, point_budget, rng):
+    x_min, x_max, y_min, y_max = framing
+    img = Image.new("L", (TILE_S, TILE_S), 0)
+    d = ImageDraw.Draw(img)
+    mask = (xs >= x_min) & (xs <= x_max) & (ys >= y_min) & (ys <= y_max)
+    xs_v = xs[mask]; ys_v = ys[mask]
+    if len(xs_v) == 0:
+        return np.zeros((TILE_S, TILE_S), dtype=np.float32)
+    if len(xs_v) > point_budget:
+        idx = rng.choice(len(xs_v), size=point_budget, replace=False)
+        xs_v = xs_v[idx]; ys_v = ys_v[idx]
+    px = ((xs_v - x_min) / max(x_max - x_min, 1e-9) * (TILE_S - 1)).astype(int)
+    py = ((ys_v - y_min) / max(y_max - y_min, 1e-9) * (TILE_S - 1)).astype(int)
+    for x_, y_ in zip(px, py):
+        d.point((x_, TILE_S - 1 - y_), fill=255)
+    arr = np.asarray(img, np.float32) / 255.0
+    soft = Image.fromarray((arr * 255).astype(np.uint8), "L").filter(
+        ImageFilter.GaussianBlur(0.6))
+    return np.asarray(soft, np.float32) / 255.0
 
 
-# ---------------------------------------------------------------------------
-# Reference patterns (clean, no drift, no noise)
-# ---------------------------------------------------------------------------
-def build_reference(phase: str) -> np.ndarray:
-    rng = np.random.default_rng(0)  # deterministic, no jitter
-    pattern = np.zeros_like(GRID)
-    for center, rel_i in PEAKS[phase]:
-        fwhm = 0.10
-        pattern += rel_i * pseudo_voigt(GRID, center, fwhm, eta=0.5)
-    if pattern.max() > 0:
-        pattern /= pattern.max()
-    return pattern.astype(np.float32)
+def _lut_apply(gray01, lut_id):
+    c = LUT_FAMILY[lut_id]
+    g = np.clip(gray01, 0, 1).astype(np.float32)
+    def poly(k): return np.clip(k[0] + k[1]*g + k[2]*g**2 + k[3]*g**3, 0, 1)
+    rgb = np.stack([poly(c["r"]), poly(c["g"]), poly(c["b"])], axis=-1)
+    return (rgb * 255).astype(np.uint8)
 
 
-def build_reference_amorphous() -> np.ndarray:
-    halo = np.exp(-0.5 * ((GRID - 20.0) / 10.0) ** 2)
-    halo /= halo.max()
-    return halo.astype(np.float32)
+def _yuv_hue_shift(rgb, deg):
+    arr = rgb.astype(np.float32)
+    yuv = np.stack([
+        0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2],
+        -0.169 * arr[..., 0] - 0.331 * arr[..., 1] + 0.500 * arr[..., 2],
+        0.500 * arr[..., 0] - 0.419 * arr[..., 1] - 0.081 * arr[..., 2],
+    ], axis=-1)
+    theta = np.deg2rad(deg)
+    c_, s_ = np.cos(theta), np.sin(theta)
+    u_new = yuv[..., 1] * c_ - yuv[..., 2] * s_
+    v_new = yuv[..., 1] * s_ + yuv[..., 2] * c_
+    out = np.stack([
+        yuv[..., 0] + 1.402 * v_new,
+        yuv[..., 0] - 0.344 * u_new - 0.714 * v_new,
+        yuv[..., 0] + 1.772 * u_new,
+    ], axis=-1)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def _make_mosaic(idx, regime_kind, forced_regime=None):
+    rng = _rng(idx, "img4")
+    # 2-4 maps per mosaic (heavier mixture)
+    n_maps = int(rng.choice([2, 3, 4], p=[0.40, 0.40, 0.20]))
+    maps_in_mix = rng.choice(6, size=n_maps, replace=False).tolist()
+
+    map_traj = {}
+    for i, m in enumerate(maps_in_mix):
+        # Force regime on the (eventual) dominant map for balancing.
+        regime_for_m = int(rng.integers(0, 4))
+        params = _sample_params(rng, m, regime_for_m)
+        ic_band = float(regime_for_m) if m == 5 else 0.0
+        if regime_kind == "long":
+            n_iters = 4000; n_trans = int(rng.integers(800, 1200))
+        else:
+            n_iters = int(rng.integers(800, 1800))
+            n_trans = int(rng.integers(20, 120))
+        xs, ys = _trajectory(m, params, n_iters, n_trans, rng, ic_band)
+        lyap = _lyapunov(m, params, rng)
+        chaos = int(lyap > 0.02)
+        atype = _classify_attractor(xs, ys, lyap)
+        map_traj[m] = dict(xs=xs, ys=ys, regime=regime_for_m,
+                           attractor=atype, chaotic=chaos)
+
+    tile_slots = list(range(N_TILES)); rng.shuffle(tile_slots)
+    drop_slots = set(tile_slots[:N_DROPOUT])
+    live_slots = tile_slots[N_DROPOUT:]
+    assignments = {}
+    for i, slot in enumerate(live_slots):
+        assignments[slot] = maps_in_mix[i % len(maps_in_mix)]
+
+    counts = {m: 0 for m in maps_in_mix}
+    for slot, mm in assignments.items():
+        counts[mm] += 1
+    dominant = min(m for m, c in counts.items() if c == max(counts.values()))
+
+    # Override dominant's regime if we need to balance class distribution.
+    if forced_regime is not None:
+        new_regime = int(forced_regime)
+        params = _sample_params(rng, dominant, new_regime)
+        ic_band = float(new_regime) if dominant == 5 else 0.0
+        if regime_kind == "long":
+            n_iters = 4000; n_trans = int(rng.integers(800, 1200))
+        else:
+            n_iters = int(rng.integers(800, 1800))
+            n_trans = int(rng.integers(20, 120))
+        xs, ys = _trajectory(dominant, params, n_iters, n_trans, rng, ic_band)
+        lyap = _lyapunov(dominant, params, rng)
+        map_traj[dominant] = dict(xs=xs, ys=ys, regime=new_regime,
+                                  attractor=_classify_attractor(xs, ys, lyap),
+                                  chaotic=int(lyap > 0.02))
+
+    mosaic = np.zeros((MOSAIC_H, MOSAIC_W, 3), dtype=np.uint8)
+    for tile_idx in range(N_TILES):
+        if tile_idx in drop_slots:
+            tile_gray = rng.random((TILE_S, TILE_S)).astype(np.float32) * 0.7
+        else:
+            m = assignments[tile_idx]
+            native = NATIVE[m]
+            nx0, nx1, ny0, ny1 = native
+            zoom = float(rng.uniform(0.25, 1.15))  # widened
+            cx = float(rng.uniform(nx0 + 0.1, nx1 - 0.1))
+            cy = float(rng.uniform(ny0 + 0.1, ny1 - 0.1))
+            half_x = (nx1 - nx0) * zoom * 0.5
+            half_y = (ny1 - ny0) * zoom * 0.5
+            framing = (cx - half_x, cx + half_x, cy - half_y, cy + half_y)
+            per_tile_budget = int(rng.integers(120, 600))
+            tile_gray = _render_tile(map_traj[m]["xs"], map_traj[m]["ys"],
+                                     framing, per_tile_budget, rng)
+
+        lut_id = int(rng.integers(0, len(LUT_FAMILY)))
+        tile_rgb = _lut_apply(tile_gray, lut_id)
+        k_rot = int(rng.integers(0, 4))
+        if k_rot:
+            tile_rgb = np.rot90(tile_rgb, k=k_rot).copy()
+        if rng.random() < 0.5:
+            tile_rgb = tile_rgb[:, ::-1, :].copy()
+        r = tile_idx // TILE_GRID[1]; col = tile_idx % TILE_GRID[1]
+        y0 = r * TILE_S; x0 = col * TILE_S
+        mosaic[y0:y0 + TILE_S, x0:x0 + TILE_S] = tile_rgb
+
+    occs = []
+    for _ in range(N_OCC):
+        ox = int(rng.integers(0, MOSAIC_W - OCC + 1))
+        oy = int(rng.integers(0, MOSAIC_H - OCC + 1))
+        mosaic[oy:oy + OCC, ox:ox + OCC, :] = 0
+        occs.append((ox, oy))
+
+    gamma = float(rng.uniform(0.5, 2.0))
+    arr = (mosaic.astype(np.float32) / 255.0) ** gamma
+    mosaic = (np.clip(arr, 0, 1) * 255).astype(np.uint8)
+    mosaic = _yuv_hue_shift(mosaic, float(rng.uniform(-25, 25)))
+    sigma = float(rng.uniform(0.0, 1.2))
+    if sigma > 0.05:
+        mosaic = np.asarray(
+            Image.fromarray(mosaic, "RGB").filter(ImageFilter.GaussianBlur(sigma)))
+    q = int(rng.integers(18, 56))
+    buf = io.BytesIO()
+    Image.fromarray(mosaic, "RGB").save(buf, format="JPEG", quality=q)
+    buf.seek(0)
+    mosaic = np.asarray(Image.open(buf).convert("RGB"))
+
+    presence = [int(m in maps_in_mix) for m in range(6)]
+    return (mosaic, presence, int(dominant),
+            int(map_traj[dominant]["regime"]),
+            int(map_traj[dominant]["attractor"]),
+            int(map_traj[dominant]["chaotic"]), occs)
+
+
+def _make_reference(m):
+    rng = _rng(99_000 + m, "ref")
+    params = _sample_params(rng, m, regime=3)
+    xs, ys = _trajectory(m, params, n_iters=4000, n_transient=1500, rng=rng)
+    mosaic = np.zeros((MOSAIC_H, MOSAIC_W, 3), dtype=np.uint8)
+    for tile_idx in range(N_TILES):
+        tile_gray = _render_tile(xs, ys, NATIVE[m], 1500, rng)
+        tile_rgb = _lut_apply(tile_gray, 0)
+        r = tile_idx // TILE_GRID[1]; col = tile_idx % TILE_GRID[1]
+        y0 = r * TILE_S; x0 = col * TILE_S
+        mosaic[y0:y0 + TILE_S, x0:x0 + TILE_S] = tile_rgb
+    return mosaic
+
+
+def _save_png(arr, path):
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGB").save(buf, format="PNG", optimize=True)
+    path.write_bytes(buf.getvalue())
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n", type=int, default=12000)
-    parser.add_argument("--out", type=str, default="./polydrift_xrd_raw")
-    args = parser.parse_args()
-
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n", type=int, default=8000)
+    ap.add_argument("--out", type=str, default="./orbitmosaic_raw")
+    args = ap.parse_args()
     out = Path(args.out)
-    (out / "patterns").mkdir(parents=True, exist_ok=True)
-    (out / "reference").mkdir(parents=True, exist_ok=True)
-    (out / "generation").mkdir(parents=True, exist_ok=True)
+    (out / "images").mkdir(parents=True, exist_ok=True)
+    (out / "reference_images").mkdir(parents=True, exist_ok=True)
 
-    master = np.random.default_rng(args.seed)
+    rng = np.random.default_rng(SEED)
+    for m in range(6):
+        _save_png(_make_reference(m),
+                  out / "reference_images" / f"map_{m}_clean.png")
 
-    # Reference patterns
-    np.save(out / "reference" / "alpha.npy", build_reference("alpha"))
-    np.save(out / "reference" / "beta.npy", build_reference("beta"))
-    np.save(out / "reference" / "gamma.npy", build_reference("gamma"))
-    np.save(out / "reference" / "amorphous.npy", build_reference_amorphous())
+    # Cycle forced regime to keep parameter_regime balanced ~25% each.
+    regime_cycle = np.tile([0, 1, 2, 3], args.n // 4 + 1)[: args.n]
+    rng.shuffle(regime_cycle)
 
     rows = []
     for i in range(args.n):
-        # Per-sample RNG seeded from master => fully reproducible regardless of order
-        sub_seed = int(master.integers(0, 2**31 - 1))
-        rng = np.random.default_rng(sub_seed)
+        regime_kind = "long" if rng.random() < 0.55 else "short"
+        forced = int(regime_cycle[i])
+        (mosaic, presence, dom, dom_reg, dom_attr,
+         dom_chao, occs) = _make_mosaic(i, regime_kind, forced_regime=forced)
+        sid = _opaque_id(i)
+        _save_png(mosaic, out / "images" / f"{sid}.png")
+        row = {"sample_id": sid}
+        for k in range(6):
+            row[f"m_{k}"] = presence[k]
+        row.update({"dominant_map": dom, "parameter_regime": dom_reg,
+                    "attractor_type": dom_attr, "is_chaotic": dom_chao,
+                    "regime_kind": regime_kind})
+        for j, (ox, oy) in enumerate(occs, start=1):
+            row[f"occ{j}_x"] = ox; row[f"occ{j}_y"] = oy
+        rows.append(row)
+        if (i + 1) % 200 == 0:
+            print(f"  generated {i+1}/{args.n}")
 
-        # Deterministic UUID from sub_seed for stable filenames across reruns
-        sample_id = uuid.UUID(int=(sub_seed << 96) | (i & 0xFFFFFFFF) & ((1 << 128) - 1)).hex[:16]
-
-        regime = "sim_A" if rng.random() < 0.55 else "sim_B"
-        acq = acquisition_params(regime, rng)
-        crystallite_nm = float(rng.uniform(15.0, 200.0))
-        fractions = sample_phase_fractions(rng)
-
-        pattern = build_pattern(fractions, crystallite_nm, acq, rng)
-        np.save(out / "patterns" / f"{sample_id}.npy", pattern)
-
-        rows.append({
-            "sample_id": sample_id,
-            "f_alpha": float(fractions[0]),
-            "f_beta": float(fractions[1]),
-            "f_gamma": float(fractions[2]),
-            "f_amorphous": float(fractions[3]),
-            "zero_shift": acq["zero_shift"],
-            "crystallite_nm": crystallite_nm,
-            "acquisition": regime,
-        })
-
-    df = pd.DataFrame(rows).sort_values("sample_id").reset_index(drop=True)
-    csv_path = out / "data.csv"
-    df.to_csv(csv_path, index=False, float_format="%.8f", lineterminator="\n")
-
-    # Copy this script into the generation/ folder for provenance
-    this_file = Path(__file__).resolve()
-    (out / "generation" / "generate.py").write_bytes(this_file.read_bytes())
-
-    # LICENSE
+    df = pd.DataFrame(rows)
+    df.to_csv(out / "data.csv", index=False)
     (out / "LICENSE.md").write_text(
-        "PolyDrift-XRD is released under CC BY 4.0.\n"
-        "Reference structure provenance: COD entries 1010368, 1011000, 1528823 (CC0).\n",
-        encoding="utf-8",
-    )
-
-    # Reproducibility hash
-    sha = hashlib.sha256(csv_path.read_bytes()).hexdigest()
-    manifest = {
-        "seed": args.seed,
-        "n_samples": args.n,
-        "n_points_per_pattern": N_POINTS,
-        "two_theta_range_deg": [TWO_THETA_MIN, TWO_THETA_MAX],
-        "data_csv_sha256": sha,
-    }
-    (out / "generation" / "manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8"
-    )
-    print(json.dumps(manifest, indent=2))
+        "OrbitMosaic synthetic benchmark, released under CC BY 4.0.\n"
+        "Procedurally generated from seed 0xC0FFEE17. No third-party data.\n",
+        encoding="utf-8")
+    sha = hashlib.sha256((out / "data.csv").read_bytes()).hexdigest()
+    print(json.dumps({"n_samples": args.n, "data_csv_sha256": sha}, indent=2))
 
 
 if __name__ == "__main__":
